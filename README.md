@@ -1,1 +1,392 @@
 # Retailmindai
+import os
+import warnings
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from xgboost import XGBRegressor
+
+warnings.filterwarnings("ignore")
+
+# ==========================================
+# RETAILMIND AI - RETAIL SALES FORECASTING
+# Datasets: Rossmann + Walmart
+# Models: XGBoost + Chronos-2 + TFT
+# ==========================================
+
+os.makedirs("outputs", exist_ok=True)
+
+
+# ------------------------------------------
+# 1. DATA LOADING AND PREPROCESSING
+# ------------------------------------------
+
+def load_rossmann():
+    path = "data/rossmann_train.csv"
+
+    df = pd.read_csv(path)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Sales"] = pd.to_numeric(df["Sales"], errors="coerce")
+
+    df = df.dropna(subset=["Date", "Sales"])
+
+    # Aggregate store sales by date
+    daily = df.groupby("Date", as_index=False).agg(
+        Sales=("Sales", "sum"),
+        Promo=("Promo", "mean"),
+        SchoolHoliday=("SchoolHoliday", "max"),
+        Open=("Open", "mean"),
+    )
+
+    if "StateHoliday" in df.columns:
+        holiday = df.groupby("Date")["StateHoliday"].apply(
+            lambda x: x.astype(str).str.lower()
+            .isin(["a", "b", "c", "1", "2", "3"]).any()
+        )
+        daily["StateHoliday"] = (
+            daily["Date"].map(holiday).astype(int)
+        )
+    else:
+        daily["StateHoliday"] = 0
+
+    daily = daily.rename(
+        columns={"Date": "date", "Sales": "sales"}
+    )
+
+    daily["dataset"] = "Rossmann"
+    daily["frequency"] = "daily"
+
+    return daily
+
+
+def load_walmart():
+    path = "data/walmart_train.csv"
+
+    df = pd.read_csv(path)
+
+    if "Weekly Sales" in df.columns:
+        df = df.rename(columns={"Weekly Sales": "Weekly_Sales"})
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Weekly_Sales"] = pd.to_numeric(
+        df["Weekly_Sales"], errors="coerce"
+    )
+
+    df = df.dropna(subset=["Date", "Weekly_Sales"])
+
+    daily = df.groupby("Date", as_index=False).agg(
+        sales=("Weekly_Sales", "sum"),
+        IsHoliday=("IsHoliday", "max"),
+    )
+
+    daily = daily.rename(columns={"Date": "date"})
+    daily["dataset"] = "Walmart"
+    daily["frequency"] = "weekly"
+
+    return daily
+
+
+# ------------------------------------------
+# 2. SEASONAL AND HOLIDAY FEATURES
+# ------------------------------------------
+
+def create_features(df):
+    df = df.copy().sort_values("date")
+
+    df["month"] = df["date"].dt.month
+    df["quarter"] = df["date"].dt.quarter
+    df["day_of_week"] = df["date"].dt.dayofweek
+    df["day_of_year"] = df["date"].dt.dayofyear
+    df["week_of_year"] = (
+        df["date"].dt.isocalendar().week.astype(int)
+    )
+
+    # Cyclical seasonal patterns
+    df["month_sin"] = np.sin(
+        2 * np.pi * df["month"] / 12
+    )
+    df["month_cos"] = np.cos(
+        2 * np.pi * df["month"] / 12
+    )
+
+    df["day_sin"] = np.sin(
+        2 * np.pi * df["day_of_year"] / 365.25
+    )
+    df["day_cos"] = np.cos(
+        2 * np.pi * df["day_of_year"] / 365.25
+    )
+
+    # Past sales only: prevents future-target leakage
+    for lag in [1, 2, 3, 4]:
+        df[f"lag_{lag}"] = df["sales"].shift(lag)
+
+    df["rolling_mean_4"] = (
+        df["sales"].shift(1).rolling(4).mean()
+    )
+
+    df["rolling_mean_8"] = (
+        df["sales"].shift(1).rolling(8).mean()
+    )
+
+    return df
+
+
+# ------------------------------------------
+# 3. XGBOOST FORECASTING MODEL
+# ------------------------------------------
+
+def run_xgboost(df):
+    df = create_features(df)
+    df = df.dropna().reset_index(drop=True)
+
+    if len(df) < 20:
+        raise ValueError("Not enough historical data.")
+
+    # Chronological split: never randomly shuffle time series
+    split = int(len(df) * 0.8)
+
+    train = df.iloc[:split]
+    test = df.iloc[split:]
+
+    excluded = ["date", "sales", "dataset", "frequency"]
+    features = [
+        c for c in df.columns
+        if c not in excluded
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+    X_train = train[features]
+    y_train = train["sales"]
+
+    X_test = test[features]
+    y_test = test["sales"]
+
+    model = XGBRegressor(
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=-1,
+    )
+
+    model.fit(X_train, y_train)
+
+    predictions = np.maximum(
+        0, model.predict(X_test)
+    )
+
+    return test, y_test.to_numpy(), predictions
+
+
+# ------------------------------------------
+# 4. EVALUATION
+# ------------------------------------------
+
+def evaluate(actual, predicted):
+    mae = mean_absolute_error(actual, predicted)
+
+    rmse = np.sqrt(
+        mean_squared_error(actual, predicted)
+    )
+
+    denominator = np.sum(np.abs(actual))
+
+    wape = (
+        np.sum(np.abs(actual - predicted))
+        / denominator * 100
+        if denominator > 0 else np.nan
+    )
+
+    return {
+        "MAE": round(mae, 3),
+        "RMSE": round(rmse, 3),
+        "WAPE_percent": round(wape, 3),
+    }
+
+
+# ------------------------------------------
+# 5. CHRONOS-2 FORECASTING MODEL
+# ------------------------------------------
+
+def run_chronos2(df):
+    import torch
+    from chronos import Chronos2Pipeline
+
+    df = df.sort_values("date").reset_index(drop=True)
+
+    split = int(len(df) * 0.8)
+
+    train = df.iloc[:split]
+    test = df.iloc[split:]
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    pipeline = Chronos2Pipeline.from_pretrained(
+        "amazon/chronos-2",
+        device_map=device,
+    )
+
+    context = train["sales"].to_numpy(
+        dtype=np.float32
+    )
+
+    forecast = pipeline.predict(
+        inputs=[context],
+        prediction_length=len(test),
+    )
+
+    result = forecast[0]
+
+    if hasattr(result, "detach"):
+        result = result.detach().cpu().numpy()
+    else:
+        result = np.asarray(result)
+
+    # Select the median forecast when quantiles are returned
+    if result.ndim == 2:
+        predictions = result[result.shape[0] // 2]
+    else:
+        predictions = result.reshape(-1)
+
+    predictions = np.maximum(
+        0, predictions[:len(test)]
+    )
+
+    return test, test["sales"].to_numpy(), predictions
+
+
+# ------------------------------------------
+# 6. MAIN EXPERIMENT
+# ------------------------------------------
+
+def main():
+    datasets = {}
+
+    try:
+        datasets["Rossmann"] = load_rossmann()
+        print("Rossmann dataset loaded.")
+    except Exception as e:
+        print("Rossmann loading error:", e)
+
+    try:
+        datasets["Walmart"] = load_walmart()
+        print("Walmart dataset loaded.")
+    except Exception as e:
+        print("Walmart loading error:", e)
+
+    results = []
+    predictions_output = []
+
+    for name, df in datasets.items():
+        print(f"\n{'=' * 45}")
+        print(f"DATASET: {name}")
+        print(f"{'=' * 45}")
+
+        # Model 1: XGBoost
+        try:
+            test, actual, pred = run_xgboost(df)
+
+            scores = evaluate(actual, pred)
+
+            results.append({
+                "Dataset": name,
+                "Model": "XGBoost",
+                **scores,
+                "Status": "OK",
+            })
+
+            print("XGBoost:", scores)
+
+            predictions_output.append(pd.DataFrame({
+                "dataset": name,
+                "model": "XGBoost",
+                "date": test["date"].to_numpy(),
+                "actual": actual,
+                "predicted": pred,
+            }))
+
+        except Exception as e:
+            print("XGBoost error:", e)
+
+        # Model 2: Chronos-2
+        try:
+            test, actual, pred = run_chronos2(df)
+
+            scores = evaluate(actual, pred)
+
+            results.append({
+                "Dataset": name,
+                "Model": "Chronos-2",
+                **scores,
+                "Status": "OK",
+            })
+
+            print("Chronos-2:", scores)
+
+            predictions_output.append(pd.DataFrame({
+                "dataset": name,
+                "model": "Chronos-2",
+                "date": test["date"].to_numpy(),
+                "actual": actual,
+                "predicted": pred,
+            }))
+
+        except Exception as e:
+            print("Chronos-2 error:", e)
+
+        # Model 3: Temporal Fusion Transformer
+        # The optional model runs through a separate module.
+        try:
+            from tft_model import run_tft
+
+            test, actual, pred = run_tft(df)
+
+            scores = evaluate(actual, pred)
+
+            results.append({
+                "Dataset": name,
+                "Model": "TFT",
+                **scores,
+                "Status": "OK",
+            })
+
+            print("TFT:", scores)
+
+            predictions_output.append(pd.DataFrame({
+                "dataset": name,
+                "model": "TFT",
+                "date": test["date"].to_numpy(),
+                "actual": actual,
+                "predicted": pred,
+            }))
+
+        except Exception as e:
+            print("TFT error:", e)
+
+    if results:
+        pd.DataFrame(results).to_csv(
+            "outputs/model_scores.csv", index=False
+        )
+
+        print("\nFINAL MODEL COMPARISON")
+        print(pd.DataFrame(results).to_string(index=False))
+
+    if predictions_output:
+        pd.concat(
+            predictions_output, ignore_index=True
+        ).to_csv(
+            "outputs/validation_predictions.csv",
+            index=False,
+        )
+
+    print("\nResults saved in the outputs folder.")
+    print("Lower MAE, RMSE and WAPE indicate better forecasts.")
+    print("Use the event's official scoring formula for the final score.")
+
+
+if __name__ == "__main__":
+    main()
